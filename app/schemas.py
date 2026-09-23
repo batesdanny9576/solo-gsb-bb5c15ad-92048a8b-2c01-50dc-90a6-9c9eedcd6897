@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$|^-?\.\d+$")
+# 仅接受完整的 ISO 日历日期 YYYY-MM-DD（date.fromisoformat 还会兜底校验合法性，
+# 如拒绝 2026-02-30）
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_iso_date(value: str, field: str = "as_of") -> date:
+    """把 ``YYYY-MM-DD`` 字符串解析为 :class:`date`；非法值抛 ValueError（->422）。"""
+
+    text = value.strip()
+    if not _ISO_DATE_RE.match(text):
+        raise ValueError(f"{field} 必须是 ISO 日期字符串 YYYY-MM-DD，收到 {value!r}")
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field} 不是合法的 ISO 日期: {value!r}") from exc
 
 
 class LineIn(BaseModel):
@@ -33,11 +49,21 @@ class InvoiceCreate(BaseModel):
     exchange_rate: str | None = Field(
         default=None, description="汇率，1 单位发票币种 = exchange_rate 单位目标币种"
     )
+    due_date: str | None = Field(
+        default=None, description="可选：到期日，ISO 日期 YYYY-MM-DD；用于逾期查询"
+    )
 
     @field_validator("currency", "target_currency")
     @classmethod
     def _upper_currency(cls, v: str | None) -> str | None:
         return v.upper().strip() if v is not None else None
+
+    @field_validator("due_date")
+    @classmethod
+    def _check_due_date(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return parse_iso_date(v, "due_date").isoformat()
 
     @field_validator("exchange_rate")
     @classmethod
@@ -123,6 +149,7 @@ class InvoiceResult(BaseModel):
     totals: TotalsOut
     rounding: RoundingOut
     fx: FxOut | None = None
+    due_date: str | None = None
     created_at: str
     recompute_matched: bool
 
@@ -145,6 +172,28 @@ class PagedInvoices(BaseModel):
     page_size: int
     total: int
     pages: int
+
+
+class OverdueInvoice(BaseModel):
+    """逾期且仍有未收余额的发票条目。金额为按币种最小单位规范化的精确字符串。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    due_date: str
+    currency: str
+    total_gross: str
+    paid_total: str
+    outstanding: str
+    created_at: str
+
+
+class PagedOverdueInvoices(BaseModel):
+    items: list[OverdueInvoice]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    as_of: str
 
 
 class Health(BaseModel):

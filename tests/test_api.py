@@ -339,6 +339,162 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(ov["paid_total"], "100.00")
         self.assertEqual(ov["outstanding"], "0.00")
 
+    def test_11_overdue_invoices(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        today = datetime.now(timezone.utc).date()
+        as_of = today.isoformat()
+
+        def iso(offset_days: int) -> str:
+            return (today + timedelta(days=offset_days)).isoformat()
+
+        def create(currency: str, net: str, due: str | None, pays: list[str]):
+            payload = {
+                "currency": currency,
+                "lines": [{"net": net, "tax_rate": "0"}],
+            }
+            if due is not None:
+                payload["due_date"] = due
+            status, inv = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, inv)
+            # due_date 被持久化并在单张查询中回显
+            status2, fetched = self._request("GET", f"/api/v1/invoices/{inv['id']}")
+            self.assertEqual(status2, 200)
+            self.assertEqual(fetched["due_date"], due)
+            for amount in pays:
+                status, pay = self._request(
+                    "POST",
+                    f"/api/v1/invoices/{inv['id']}/payments",
+                    {"amount": amount},
+                )
+                self.assertEqual(status, 201, pay)
+            return int(inv["id"])
+
+        # 逾期未付 USD
+        i_old = create("USD", "100.00", iso(-53), [])
+        # 逾期已部分支付：余额 13.11
+        i_half = create("USD", "33.11", iso(-1), ["20.00"])
+        # 到期日恰为 as_of：不算逾期
+        i_due_today = create("USD", "10.00", as_of, [])
+        # 未来到期
+        i_future = create("USD", "10.00", iso(99), [])
+        # 无到期日：永不纳入
+        i_no_due = create("USD", "10.00", None, [])
+        # 逾期但已收满：不纳入
+        i_paid = create("USD", "10.00", iso(-22), ["10.00"])
+        # 逾期 JPY（0 位小数币种），精确余额不带小数点
+        i_jpy = create("JPY", "1000", iso(-13), [])
+
+        expected_ids = {i_old, i_half, i_jpy}
+
+        status, body = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={as_of}&page=1&page_size=20"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["as_of"], as_of)
+        ids = [item["id"] for item in body["items"]]
+        self.assertEqual(ids, sorted(ids, reverse=True))  # 按 id 倒序
+        self.assertEqual(set(ids), expected_ids)
+        self.assertNotIn(i_due_today, ids)
+        self.assertNotIn(i_future, ids)
+        self.assertNotIn(i_no_due, ids)
+        self.assertNotIn(i_paid, ids)
+        self.assertEqual(body["total"], 3)
+        self.assertEqual(body["pages"], 1)
+
+        by_id = {item["id"]: item for item in body["items"]}
+        old = by_id[i_old]
+        self.assertEqual(old["currency"], "USD")
+        self.assertEqual(old["due_date"], iso(-53))
+        self.assertEqual(old["total_gross"], "100.00")
+        self.assertEqual(old["paid_total"], "0.00")
+        self.assertEqual(old["outstanding"], "100.00")
+        self.assertIn("created_at", old)
+        half = by_id[i_half]
+        self.assertEqual(half["paid_total"], "20.00")
+        self.assertEqual(half["outstanding"], "13.11")
+        jpy = by_id[i_jpy]
+        self.assertEqual(jpy["currency"], "JPY")
+        self.assertEqual(jpy["outstanding"], "1000")
+
+        # 分页：3 条、每页 2 条，按 id 倒序
+        status, p1 = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={as_of}&page=1&page_size=2"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([x["id"] for x in p1["items"]], [i_jpy, i_half])
+        self.assertEqual(p1["total"], 3)
+        self.assertEqual(p1["pages"], 2)
+        status, p2 = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={as_of}&page=2&page_size=2"
+        )
+        self.assertEqual([x["id"] for x in p2["items"]], [i_old])
+        status, p3 = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={as_of}&page=3&page_size=2"
+        )
+        self.assertEqual(p3["items"], [])
+
+        # as_of 提前到所有到期日之前：空集
+        status, body = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={iso(-36500)}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["pages"], 0)
+        self.assertEqual(body["as_of"], iso(-36500))
+
+        # 无效 as_of -> 422
+        for bad in ("not-a-date", "2026-02-30", "2026/09/23", "2026-9-1"):
+            status, body = self._request(
+                "GET", f"/api/v1/invoices/overdue?as_of={bad}"
+            )
+            self.assertEqual(status, 422, bad)
+            self.assertIn("detail", body)
+
+        # 分页参数越界 -> 422
+        status, _ = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={as_of}&page=0"
+        )
+        self.assertEqual(status, 422)
+        status, _ = self._request(
+            "GET", f"/api/v1/invoices/overdue?as_of={as_of}&page_size=101"
+        )
+        self.assertEqual(status, 422)
+
+        # 不带 as_of：缺省 UTC 当前日期，集合与显式传参完全一致
+        status, body = self._request("GET", "/api/v1/invoices/overdue")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["as_of"], as_of)
+        self.assertEqual({x["id"] for x in body["items"]}, expected_ids)
+
+    def test_12_due_date_validation(self) -> None:
+        # 合法：创建并持久化
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "due_date": "2026-10-01",
+                "lines": [{"net": "10.00", "tax_rate": "0"}],
+            },
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["due_date"], "2026-10-01")
+
+        # 非法日期 -> 422
+        for bad in ("2026-13-01", "2026-02-30", "10/01/2026", "not-a-date"):
+            status, body = self._request(
+                "POST",
+                "/api/v1/invoices",
+                {
+                    "currency": "USD",
+                    "due_date": bad,
+                    "lines": [{"net": "10.00", "tax_rate": "0"}],
+                },
+            )
+            self.assertEqual(status, 422, bad)
+
 
 if __name__ == "__main__":
     unittest.main()

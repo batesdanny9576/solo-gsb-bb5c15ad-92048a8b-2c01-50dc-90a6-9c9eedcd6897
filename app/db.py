@@ -1,7 +1,8 @@
 """SQLite 持久化层。
 
 存储三张表：
-* ``invoices``      —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
+* ``invoices``      —— 发票头（含原始请求 JSON，用于复算）、可选到期日
+                       ``due_date`` 与汇总金额；
 * ``invoice_lines`` —— 逐行结果（税额残差分配后的最终值，含换算列）；
 * ``payments``      —— 收款登记（每笔收款的金额、币种与登记时间）。
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     residual_units  INTEGER NOT NULL,
     rule_id         TEXT NOT NULL,
     request_json    TEXT NOT NULL,
+    due_date        TEXT,
     created_at      TEXT NOT NULL
 );
 
@@ -100,6 +102,12 @@ def connect(database: str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 兼容旧库：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列；
+    # due_date 索引也必须等列补齐后才能创建（否则旧库执行到建索引会报错）
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()}
+    if "due_date" not in cols:
+        conn.execute("ALTER TABLE invoices ADD COLUMN due_date TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_due_date ON invoices(due_date)")
     conn.commit()
 
 
@@ -113,8 +121,8 @@ def save_invoice(conn: sqlite3.Connection, payload: dict[str, Any], result: dict
                 currency, currency_digits, target_currency, exchange_rate,
                 total_net, total_tax, total_gross,
                 conv_total_net, conv_total_tax, conv_total_gross,
-                residual_units, rule_id, request_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                residual_units, rule_id, request_json, due_date, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result["currency"],
@@ -130,6 +138,7 @@ def save_invoice(conn: sqlite3.Connection, payload: dict[str, Any], result: dict
                 result["rounding"]["residual_units"],
                 result["rule_id"],
                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                payload.get("due_date"),
                 utc_now_iso(),
             ),
         )
@@ -303,3 +312,57 @@ def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str
             for r in rows
         ],
     }
+
+
+# ---- 逾期查询 ----
+
+
+def list_overdue_invoices(
+    conn: sqlite3.Connection, as_of: date, page: int, page_size: int
+) -> tuple[list[dict[str, Any]], int]:
+    """逾期且仍有未收余额的发票，按 id 倒序分页。
+
+    逾期定义：``due_date`` 非空且 **严格早于** ``as_of``（到期日当天不算逾期）；
+    未收余额沿用与收款登记完全相同的 Decimal 规则——已收金额逐笔 Decimal 求和，
+    按币种最小单位量化后与含税总额相减，仅保留余额严格大于 0 的发票。
+    缺少 ``due_date`` 的发票在 SQL 层即被排除。
+
+    日期均为 ISO 8601 ``YYYY-MM-DD`` 文本存储，字典序与时间序一致，可直接比较。
+
+    :returns: (当前页条目列表, 符合条件的总条数)
+    """
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT * FROM invoices
+            WHERE due_date IS NOT NULL AND due_date < ?
+            ORDER BY id DESC
+            """,
+            (as_of.isoformat(),),
+        ).fetchall()
+    )
+
+    overdue: list[dict[str, Any]] = []
+    for inv in rows:
+        unit = _minor_unit(int(inv["currency_digits"]))
+        paid = _paid_total(conn, int(inv["id"])).quantize(unit)
+        gross = Decimal(inv["total_gross"])
+        outstanding = gross - paid
+        if outstanding <= 0:
+            continue
+        overdue.append(
+            {
+                "id": int(inv["id"]),
+                "due_date": inv["due_date"],
+                "currency": inv["currency"],
+                "total_gross": inv["total_gross"],
+                "paid_total": format(paid, "f"),
+                "outstanding": format(outstanding, "f"),
+                "created_at": inv["created_at"],
+            }
+        )
+
+    total = len(overdue)
+    offset = (page - 1) * page_size
+    return overdue[offset : offset + page_size], total
