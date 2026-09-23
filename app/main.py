@@ -9,6 +9,7 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -22,9 +23,11 @@ from .schemas import (
     InvoiceCreate,
     InvoiceResult,
     PagedInvoices,
+    PagedOverdueInvoices,
     PaymentCreate,
     PaymentOverview,
     PaymentResult,
+    parse_iso_date,
 )
 
 
@@ -38,11 +41,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
-        "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询，"
-        "SQLite 持久化。"
+        "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
+        "到期日（due_date）与逾期发票分页查询，SQLite 持久化。"
     ),
     lifespan=lifespan,
 )
@@ -121,8 +124,13 @@ def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, 
             "allocations": fresh["fx"]["allocations"],
         }
 
-    core = {k: v for k, v in result.items() if k not in ("id", "created_at", "recompute_matched")}
+    core = {
+        k: v
+        for k, v in result.items()
+        if k not in ("id", "created_at", "recompute_matched", "due_date")
+    }
     result["id"] = row["id"]
+    result["due_date"] = row["due_date"]
     result["created_at"] = row["created_at"]
     result["recompute_matched"] = recompute_matches(core, stored_request)
     return result
@@ -148,7 +156,9 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> Health:
 def create_invoice(
     payload: InvoiceCreate, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict[str, Any]:
-    data = payload.model_dump()
+    # mode="json"：due_date 等 date 字段也以 ISO 字符串进入纯数据字典，
+    # compute_invoice 只读取金额/币种字段，额外键会被忽略
+    data = payload.model_dump(mode="json")
     try:
         result = compute_invoice(data)
     except UnknownCurrencyError as exc:
@@ -158,6 +168,39 @@ def create_invoice(
     row = database.get_invoice(conn, invoice_id)
     line_rows = database.get_lines(conn, invoice_id)
     return _row_to_result(row, line_rows)
+
+
+@app.get(
+    "/api/v1/invoices/overdue",
+    response_model=PagedOverdueInvoices,
+    tags=["invoices"],
+)
+def list_overdue_invoices(
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数，1~100"),
+    as_of: str | None = Query(
+        None,
+        description="截止日期 ISO 8601（YYYY-MM-DD）；缺省取 UTC 当前日期。"
+        "仅返回 due_date 严格早于该日且未收余额大于零的发票",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    if as_of is None:
+        cutoff = datetime.now(timezone.utc).date()
+    else:
+        # 非法日期走全局 ValueError -> 422 处理器
+        cutoff = parse_iso_date(as_of, "as_of")
+
+    items, total = database.list_overdue_invoices(conn, cutoff, page, page_size)
+    pages = (total + page_size - 1) // page_size if total else 0
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages,
+        "as_of": cutoff.isoformat(),
+    }
 
 
 @app.get(

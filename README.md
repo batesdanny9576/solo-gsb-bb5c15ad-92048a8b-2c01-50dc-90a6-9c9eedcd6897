@@ -7,6 +7,7 @@
 - **残差固定分配且可复算**：发票总额与「逐行舍入后税额之和」的差（残差）按**最大余数法**确定性地分配回具体行，任何时候用同一请求复算结果完全一致（响应中带 `recompute_matched` 标志）。
 - **跨币种换算**：按请求汇率换算，原币金额完整保留，目标币独立做最小单位舍入与残差分配。
 - **收款登记**：按发票登记收款（发票币种字符串、必须大于 0），随时查询收款记录与未收余额；累计收款不得超过含税总额，校验与写入在同一 SQLite 事务中完成，并发不会超收。
+- **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
 - 内置 OpenAPI 交互文档（Swagger UI / ReDoc）。
 
@@ -52,6 +53,7 @@ curl -s -X POST http://localhost:8000/api/v1/invoices \
   -H 'Content-Type: application/json' \
   -d '{
     "currency": "USD",
+    "due_date": "2026-09-30",
     "lines": [
       {"description": "笔记本", "net": "10.05", "tax_rate": "0.10"},
       {"description": "签字笔", "net": "20.05", "tax_rate": "0.10"}
@@ -64,7 +66,12 @@ curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
   -d '{"amount": "20.00"}'
 
 curl -s http://localhost:8000/api/v1/invoices/1/payments
+
+# 查询已逾期且仍有未收余额的发票（as_of 缺省取 UTC 当前日期）
+curl -s 'http://localhost:8000/api/v1/invoices/overdue?page=1&page_size=20&as_of=2026-10-15'
 ```
+
+> 以上命令要求服务已启动：在仓库根目录执行 `docker compose up -d --build`（见下一节）。
 
 该请求每行精确税额为 1.005 / 2.005（逐行 HALF_UP 得 1.01 / 2.01），但总税额
 3.01（30.10×10%），行和 3.02，产生 **-0.01 残差**，按最大余数法从零头最小的
@@ -91,10 +98,13 @@ curl -s http://localhost:8000/api/v1/invoices/1/payments
     "method": "largest_remainder",
     "allocations": [{"line_no": 1, "delta_units": -1, "remainder": "0.005", "rank": 1}]
   },
+  "due_date": "2026-09-30",
   "created_at": "2026-09-23T01:40:00Z",
   "recompute_matched": true
 }
 ```
+
+不传 `due_date` 时该字段返回 `null`，行为与旧版一致。
 
 注意不变量：**逐行 `tax` 之和恒等于 `totals.total_tax`**（1.00 + 2.01 = 3.01）。
 
@@ -139,14 +149,16 @@ curl -s http://localhost:8000/api/v1/invoices/1/payments
 
 ## 3. API 一览
 
-Base URL：`http://localhost:8000`
+Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
+在仓库根目录执行 `docker compose up -d --build`，停止用 `docker compose down`）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查（含数据库探活） |
-| `POST` | `/api/v1/invoices` | 创建并计算发票（持久化后返回完整结果），`201` |
+| `POST` | `/api/v1/invoices` | 创建并计算发票（可选 `due_date`，持久化后返回完整结果），`201` |
 | `GET` | `/api/v1/invoices/{id}` | 按 id 查询单张发票（含逐行明细与复算标志） |
 | `GET` | `/api/v1/invoices?page=1&page_size=20` | 分页列表（按 id 倒序），`page_size` 范围 1~100 |
+| `GET` | `/api/v1/invoices/overdue` | 逾期发票分页查询（按 id 倒序），支持 `page`、`page_size`、可选 `as_of` |
 | `POST` | `/api/v1/invoices/{id}/payments` | 登记一笔收款（发票币种字符串、必须大于 0），`201` |
 | `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录与未收余额 |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
@@ -163,6 +175,7 @@ Base URL：`http://localhost:8000`
 | `lines[].description` | string | 否 | 行备注，最长 500 字 |
 | `target_currency` | string | 否 | 换算目标币种；与 `currency` 不同时必填 `exchange_rate` |
 | `exchange_rate` | string | 条件必填 | 汇率：`1 currency = exchange_rate target_currency`，必须为正数 |
+| `due_date` | string | 否 | 到期日，ISO 8601 **日期** `YYYY-MM-DD`（如 `2026-10-01`）；仅接受日期形状（带时间如 `2026-10-01T00:00:00Z`、不存在的日期均返回 `422`），缺省为 `null` 且不纳入逾期统计 |
 
 跨币种示例：
 
@@ -265,12 +278,64 @@ curl -s http://localhost:8000/api/v1/invoices/1/payments
 }
 ```
 
-### 3.4 错误码
+### 3.4 逾期发票查询 `GET /api/v1/invoices/overdue`
+
+查询参数：
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `page` | int | 否 | `1` | 页码，从 1 开始；`< 1` 返回 `422` |
+| `page_size` | int | 否 | `20` | 每页条数，范围 1~100；越界返回 `422` |
+| `as_of` | string | 否 | UTC 当前日期 | 截止日，ISO 8601 **日期** `YYYY-MM-DD`；格式不符或日期不存在（含带时间成分）返回 `422` |
+
+**逾期口径**（三者同时满足）：
+
+1. 发票设置了 `due_date`（**缺少到期日的不纳入**）；
+2. `due_date` **严格早于** `as_of`（到期日当天不算逾期）；
+3. **未收余额大于零**（`total_gross − 已收合计 > 0`），已收满的发票不纳入。
+
+结果**按 id 倒序**分页；每条包含发票 `id`、`currency`、`due_date`、含税总额
+`total_gross`、已收合计 `paid_total` 与精确未收余额 `outstanding`（均为发票币种的
+十进制字符串，余额计算全程 `Decimal`，沿用收款登记的最小单位规则），响应体额外
+回显实际使用的 `as_of`。
+
+```bash
+# 指定截止日
+curl -s 'http://localhost:8000/api/v1/invoices/overdue?page=1&page_size=20&as_of=2026-10-15'
+
+# 不传 as_of：以 UTC 当前日期为截止日
+curl -s 'http://localhost:8000/api/v1/invoices/overdue'
+```
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "currency": "USD",
+      "due_date": "2026-09-30",
+      "total_gross": "33.11",
+      "paid_total": "20.00",
+      "outstanding": "13.11",
+      "created_at": "2026-09-23T01:40:00Z"
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 1,
+  "pages": 1,
+  "as_of": "2026-10-15"
+}
+```
+
+无逾期发票时 `items` 为空、`total`/`pages` 为 `0`。
+
+### 3.5 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
 | `404` | 发票 id 不存在（含收款登记/查询时） |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款金额 ≤ 0、收款小于币种最小单位、累计收款超过含税总额等（响应体 `detail` 为中文说明） |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款金额 ≤ 0、收款小于币种最小单位、累计收款超过含税总额、`due_date` / `as_of` 不是合法 ISO 日期、分页参数越界等（响应体 `detail` 为中文说明） |
 
 ---
 
@@ -311,7 +376,7 @@ pip install -r requirements.txt
 python -m unittest tests.test_calc -v
 
 # API 端到端（自动在空闲端口起真实 uvicorn：健康检查、增查、分页、收款登记/余额、
-# 超额 422 不留记录、并发不超收、持久化）
+# 超额 422 不留记录、并发不超收、due_date 持久化、逾期分页/422、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -322,20 +387,22 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 收款登记与余额查询
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 收款登记与余额查询
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串）
-│   └── db.py          # SQLite 建表 / 事务写入（发票 + 收款）/ 查询（WAL）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期模型）
+│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款）/ 查询（含逾期，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试（含并发收款不超收）
+│   └── test_api.py    # 真实 HTTP 端到端测试（含并发收款不超收、到期日与逾期查询）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
 
-存储模型：`invoices`（发票头 + 汇总金额 + 原始请求 JSON，供复算）、
-`invoice_lines`（逐行最终税额/含税及换算列）与 `payments`（收款登记：金额、
-币种、登记时间）三张表，均通过外键级联删除。
+存储模型：`invoices`（发票头 + 汇总金额 + 可选到期日 `due_date` + 原始请求 JSON，
+供复算）、`invoice_lines`（逐行最终税额/含税及换算列）与 `payments`（收款登记：
+金额、币种、登记时间）三张表，均通过外键级联删除。升级到含 `due_date` 的版本时，
+服务启动会自动对旧库执行 `ALTER TABLE ... ADD COLUMN due_date`，历史发票的
+到期日为空、不会出现在逾期结果中。

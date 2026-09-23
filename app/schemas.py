@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$|^-?\.\d+$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_iso_date(value: str, field: str = "日期") -> date:
+    """严格解析 ISO 8601 **日期**（YYYY-MM-DD）。
+
+    只接受日期形状，拒绝带时间的字符串（如 ``2026-09-23T00:00:00Z``）与
+    不存在的日期（如 ``2026-02-30``）；失败抛 ``ValueError``（API 层映射为 422）。
+    """
+
+    text = value.strip()
+    if not _ISO_DATE_RE.match(text):
+        raise ValueError(f"{field} 必须是 ISO 日期（YYYY-MM-DD），收到 {value!r}")
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field} 不是合法日期（YYYY-MM-DD），收到 {value!r}") from exc
 
 
 class LineIn(BaseModel):
@@ -33,11 +51,21 @@ class InvoiceCreate(BaseModel):
     exchange_rate: str | None = Field(
         default=None, description="汇率，1 单位发票币种 = exchange_rate 单位目标币种"
     )
+    due_date: str | None = Field(
+        default=None, description="可选：到期日，ISO 8601 日期 YYYY-MM-DD（如 '2026-10-01'）"
+    )
 
     @field_validator("currency", "target_currency")
     @classmethod
     def _upper_currency(cls, v: str | None) -> str | None:
         return v.upper().strip() if v is not None else None
+
+    @field_validator("due_date")
+    @classmethod
+    def _check_due_date(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return parse_iso_date(v, "due_date").isoformat()
 
     @field_validator("exchange_rate")
     @classmethod
@@ -123,6 +151,7 @@ class InvoiceResult(BaseModel):
     totals: TotalsOut
     rounding: RoundingOut
     fx: FxOut | None = None
+    due_date: str | None = None
     created_at: str
     recompute_matched: bool
 
@@ -195,3 +224,28 @@ class PaymentOverview(BaseModel):
     outstanding: str
     payment_count: int
     payments: list[PaymentOut]
+
+
+# ---- 逾期查询 ----
+
+
+class OverdueInvoice(BaseModel):
+    """逾期发票条目：到期日早于 as_of 且仍有未收余额。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    currency: str
+    due_date: str
+    total_gross: str
+    paid_total: str
+    outstanding: str
+    created_at: str
+
+
+class PagedOverdueInvoices(BaseModel):
+    items: list[OverdueInvoice]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    as_of: str

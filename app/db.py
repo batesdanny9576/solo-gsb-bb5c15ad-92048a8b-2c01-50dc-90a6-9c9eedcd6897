@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     currency_digits INTEGER NOT NULL,
     target_currency TEXT,
     exchange_rate   TEXT,
+    due_date        TEXT,
     total_net       TEXT NOT NULL,
     total_tax       TEXT NOT NULL,
     total_gross     TEXT NOT NULL,
@@ -51,6 +52,9 @@ CREATE TABLE IF NOT EXISTS invoice_lines (
 );
 
 CREATE INDEX IF NOT EXISTS idx_invoices_created_at ON invoices(created_at);
+
+-- 逾期查询只关心已设置到期日的发票
+CREATE INDEX IF NOT EXISTS idx_invoices_due_date ON invoices(due_date);
 
 CREATE TABLE IF NOT EXISTS payments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +103,16 @@ def connect(database: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    # 兼容 v1.1 旧库：先为已存在的 invoices 表补上 due_date 列，
+    # 再执行 CREATE ... IF NOT EXISTS（新库则无表可迁，直接由 SCHEMA 建出）
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='invoices'"
+    ).fetchone()
+    if table_exists is not None:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()}
+        if "due_date" not in columns:
+            conn.execute("ALTER TABLE invoices ADD COLUMN due_date TEXT")
+            conn.commit()
     conn.executescript(SCHEMA)
     conn.commit()
 
@@ -111,16 +125,18 @@ def save_invoice(conn: sqlite3.Connection, payload: dict[str, Any], result: dict
             """
             INSERT INTO invoices (
                 currency, currency_digits, target_currency, exchange_rate,
+                due_date,
                 total_net, total_tax, total_gross,
                 conv_total_net, conv_total_tax, conv_total_gross,
                 residual_units, rule_id, request_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result["currency"],
                 result["currency_digits"],
                 result.get("fx", {}).get("target_currency"),
                 result.get("fx", {}).get("exchange_rate"),
+                payload.get("due_date"),
                 result["totals"]["total_net"],
                 result["totals"]["total_tax"],
                 result["totals"]["total_gross"],
@@ -189,6 +205,70 @@ def list_invoices(
         ).fetchall()
     )
     return rows, total
+
+
+# ---- 逾期查询 ----
+
+
+def list_overdue_invoices(
+    conn: sqlite3.Connection, as_of: date, page: int, page_size: int
+) -> tuple[list[dict[str, Any]], int]:
+    """逾期发票分页查询。
+
+    逾期口径：``due_date`` 非空且 **严格早于** ``as_of``，且按 Decimal 逐笔求和
+    得到的未收余额（total_gross − Σ payments.amount）**大于 0**；缺少到期日、
+    已收满（余额 0）的发票不纳入。结果按 id 倒序。
+
+    未收余额不走 SQLite 浮点聚合：一次性取回候选发票的收款流水，在 Python 侧
+    用 Decimal 逐发票（每张发票币种单一）求和。
+    """
+
+    as_of_text = as_of.isoformat()
+    rows = list(
+        conn.execute(
+            """
+            SELECT * FROM invoices
+            WHERE due_date IS NOT NULL AND due_date < ?
+            ORDER BY id DESC
+            """,
+            (as_of_text,),
+        ).fetchall()
+    )
+    if not rows:
+        return [], 0
+
+    paid_rows = conn.execute(
+        "SELECT invoice_id, amount FROM payments WHERE invoice_id IN (%s)"
+        % ",".join(str(int(r["id"])) for r in rows)
+    ).fetchall()
+    paid_map: dict[int, Decimal] = {}
+    for pr in paid_rows:
+        paid_map[pr["invoice_id"]] = paid_map.get(
+            pr["invoice_id"], Decimal("0")
+        ) + Decimal(pr["amount"])
+
+    overdue: list[dict[str, Any]] = []
+    for r in rows:
+        unit = _minor_unit(int(r["currency_digits"]))
+        gross = Decimal(r["total_gross"])
+        paid = paid_map.get(int(r["id"]), Decimal("0")).quantize(unit)
+        outstanding = gross - paid
+        if outstanding > 0:
+            overdue.append(
+                {
+                    "id": int(r["id"]),
+                    "currency": r["currency"],
+                    "due_date": r["due_date"],
+                    "total_gross": format(gross, "f"),
+                    "paid_total": format(paid, "f"),
+                    "outstanding": format(outstanding, "f"),
+                    "created_at": r["created_at"],
+                }
+            )
+
+    total = len(overdue)
+    offset = (page - 1) * page_size
+    return overdue[offset : offset + page_size], total
 
 
 # ---- 收款登记 ----
